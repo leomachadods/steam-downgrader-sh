@@ -134,21 +134,36 @@ remote_version() {
     | grep -m1 -oE '"version"[[:space:]]+"[0-9]+"' | grep -oE '[0-9]+' || true
 }
 
+# curl para o archive.org, que as vezes entrega a ~10 KB/s: em vez de um
+# --max-time curto (que cortava o download no meio), so desiste se a conexao
+# praticamente parar (<2 KB/s por 60s), e tenta de novo em erro transitorio.
+archive_curl() {
+  curl -fsSL --connect-timeout 20 --speed-limit 2048 --speed-time 60 \
+       --max-time 1800 --retry 3 --retry-delay 5 "$@"
+}
+
 # versoes do cliente arquivadas no Internet Archive (mais antiga -> mais nova)
 archive_versions() {
-  curl -s --max-time 60 "$ARCHIVE_META" | python3 -c '
+  log "consultando o Internet Archive (pode demorar se o archive.org estiver lento)..." >&2
+  local json
+  if ! json=$(archive_curl "$ARCHIVE_META"); then
+    err "falha ao baixar a lista de versoes do archive.org (veja o erro do curl acima)"
+    return 1
+  fi
+  python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
+except Exception as e:
+    print("resposta invalida do archive.org: %s" % e, file=sys.stderr)
+    sys.exit(1)
 vs=set()
 for f in d.get("files",[]):
     p=f.get("name","").split("/")
     if len(p)>=3 and p[0]==sys.argv[1] and p[1].isdigit():
         vs.add(p[1])
 print("\n".join(sorted(vs,key=int)))
-' "$PKG_UBUNTU12"
+' "$PKG_UBUNTU12" <<< "$json"
 }
 
 # le um bloco do manifesto VDF: manifest_get <arquivo> <bloco> <campo>
@@ -328,9 +343,9 @@ cmd_status() {
 cmd_list() {
   step "Versoes do cliente arquivadas no Internet Archive"
   local cur; cur=$(installed_version "$STEAM_ROOT" || echo "0")
-  local versions; versions=$(archive_versions)
-  [ -n "$versions" ] || die "nao foi possivel listar o arquivo (sem rede?)"
-  local target; target=$(pick_target_version "$cur" "" 2>/dev/null || echo "")
+  local versions; versions=$(archive_versions) || die "nao foi possivel listar o arquivo."
+  [ -n "$versions" ] || die "o arquivo nao tem versoes de ${PKG_UBUNTU12}."
+  local target; target=$(latest_below "$cur" "$versions")
   while read -r v; do
     [ -z "$v" ] && continue
     local mark="   "
@@ -348,16 +363,22 @@ pick_target_version() {
   if [ -n "$requested" ]; then
     printf '%s' "$requested"; return 0
   fi
-  local versions; versions=$(archive_versions)
-  [ -n "$versions" ] || die "nao foi possivel consultar o arquivo (sem rede?)"
-  local best=""
+  local versions; versions=$(archive_versions) || die "nao foi possivel consultar o arquivo."
+  [ -n "$versions" ] || die "o arquivo nao tem versoes de ${PKG_UBUNTU12}."
+  local best; best=$(latest_below "$current" "$versions")
+  [ -n "$best" ] || die "nao ha versao arquivada anterior a $current."
+  printf '%s' "$best"
+}
+
+# maior versao da lista (uma por linha) que seja menor que <atual>; vazio se nenhuma
+latest_below() {
+  local current="$1" versions="$2" best="" v
   while read -r v; do
     [ -z "$v" ] && continue
     if [ "$v" -lt "$current" ] && { [ -z "$best" ] || [ "$v" -gt "$best" ]; }; then
       best="$v"
     fi
   done <<< "$versions"
-  [ -n "$best" ] || die "nao ha versao arquivada anterior a $current."
   printf '%s' "$best"
 }
 
@@ -381,7 +402,7 @@ cmd_downgrade() {
 
   step "1/5 baixando o manifesto e o launcher da versao $TARGET_VERSION"
   local mf="$work/manifest"
-  curl -fsSL --max-time 120 -o "$mf" "${base}/${PKG_UBUNTU12}" \
+  archive_curl -o "$mf" "${base}/${PKG_UBUNTU12}" \
     || die "falha ao baixar o manifesto em ${base}/${PKG_UBUNTU12}"
   local mver; mver=$(manifest_version "$mf")
   [ "$mver" = "$TARGET_VERSION" ] || die "manifesto inesperado: $mver (esperado $TARGET_VERSION)"
@@ -392,7 +413,7 @@ cmd_downgrade() {
   [ -n "$lfile" ] && [ -n "$lsha" ] || die "manifesto sem a entrada do launcher (steam_ubuntu12)."
 
   log "baixando $lfile"
-  curl -fsSL --max-time 300 -o "$work/launcher.zip" "${base}/${lfile}" \
+  archive_curl -o "$work/launcher.zip" "${base}/${lfile}" \
     || die "falha ao baixar o launcher."
   local got; got=$(sha256_of "$work/launcher.zip")
   [ "$got" = "$lsha" ] || die "SHA2 do launcher diverge (esperado $lsha, obtido $got)."
@@ -501,10 +522,10 @@ cmd_undo() {
     # o launcher novo (que so conhece o steamrt64) nunca atualizaria o ubuntu12.
     local work; work=$(mktemp -d /tmp/steam-undo.XXXXXX); WORK_DIR="$work"
     local base="${ARCHIVE_BASE}/${cur_ub}" mf lfile lsha
-    if curl -fsSL --max-time 120 -o "$work/manifest" "${base}/${PKG_UBUNTU12}" 2>/dev/null; then
+    if archive_curl -o "$work/manifest" "${base}/${PKG_UBUNTU12}" 2>/dev/null; then
       lfile=$(manifest_get "$work/manifest" "steam_ubuntu12" "file")
       lsha=$(manifest_get "$work/manifest" "steam_ubuntu12" "sha2")
-      if [ -n "$lfile" ] && curl -fsSL --max-time 300 -o "$work/launcher.zip" "${base}/${lfile}" 2>/dev/null; then
+      if [ -n "$lfile" ] && archive_curl -o "$work/launcher.zip" "${base}/${lfile}" 2>/dev/null; then
         if [ -z "$lsha" ] || [ "$(sha256_of "$work/launcher.zip")" = "$lsha" ]; then
           unzip -o -q "$work/launcher.zip" -d "$work/old" 2>/dev/null || true
           if [ -f "$work/old/ubuntu12_32/steam" ]; then
